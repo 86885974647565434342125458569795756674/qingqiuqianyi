@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
-import torch.distributed as dist
 from torch import nn
 
 from transformers.pipelines.base import no_collate_fn, pad_collate_fn
@@ -24,9 +23,10 @@ from transformers.generation.stopping_criteria import (
 
 from multiprocessing import Process, Queue
 
-seq_list = ["Hello, I'm a language model,", "Who is Jack?", "I want some rice,"]
+import torch
 
-def text2id(tokenizer,framework, batch_size=2, feature_extractor=None):
+def text2id(q,tokenizer,framework, batch_size=8, feature_extractor=None):
+    seq_list = ["Hello, I'm a language model,", "Who is Jack?", "I want some rice,"]
     # while True:
     #     yield random.sample(seq_list, 1)[0]
     prompt_texts = np.random.choice(seq_list, batch_size)
@@ -36,11 +36,44 @@ def text2id(tokenizer,framework, batch_size=2, feature_extractor=None):
         inputs["prompt_text"] = prompt_text
         items.append(inputs)
     collate_fn = no_collate_fn if batch_size == 1 else pad_collate_fn(tokenizer, feature_extractor)
-    return collate_fn(items)
-def data(tokenizer,framework, batch_size=2, feature_extractor=None):
-# 从显存获取
+    # {'attention_mask': tensor([[1, 1, 1, 1, 1, 0, 0, 0],
+    #                            [1, 1, 1, 1, 1, 1, 1, 1],
+    #                            [1, 1, 1, 1, 1, 0, 0, 0],
+    #                            [1, 1, 1, 1, 1, 0, 0, 0],
+    #                            [1, 1, 1, 1, 1, 1, 1, 1],
+    #                            [1, 1, 1, 1, 1, 1, 1, 1],
+    #                            [1, 1, 1, 1, 1, 0, 0, 0],
+    #                            [1, 1, 1, 1, 0, 0, 0, 0]]),
+    #  'prompt_text': ['I want some rice,', "Hello, I'm a language model,", 'I want some rice,', 'I want some rice,',
+    #                  "Hello, I'm a language model,", "Hello, I'm a language model,", 'I want some rice,',
+    #                  'Who is Jack?'], 'input_ids': tensor([[40, 765, 617, 11464, 11, 50256, 50256, 50256],
+    #                                                        [15496, 11, 314, 1101, 257, 3303, 2746, 11],
+    #                                                        [40, 765, 617, 11464, 11, 50256, 50256, 50256],
+    #                                                        [40, 765, 617, 11464, 11, 50256, 50256, 50256],
+    #                                                        [15496, 11, 314, 1101, 257, 3303, 2746, 11],
+    #                                                        [15496, 11, 314, 1101, 257, 3303, 2746, 11],
+    #                                                        [40, 765, 617, 11464, 11, 50256, 50256, 50256],
+    #                                                        [8241, 318, 3619, 30, 50256, 50256, 50256, 50256]])}
+    x = collate_fn(items)
+    ids_tensor = q.get(block=True)
+    if ids_tensor==None:
+        q.put(x, block=True)
+    else:
+        ids_tensor["input_ids"] = torch.cat((ids_tensor["input_ids"],x["input_ids"]), dim=0)
+        ids_tensor["attention_mask"] = torch.cat((ids_tensor["attention_mask"],x["attention_mask"]), dim=0)
+        ids_tensor["prompt_text"] = torch.cat((ids_tensor["prompt_text"],x["prompt_text"]), dim=0)
+        q.put(ids_tensor, block=True)
 
-
+def data(q,batch_size=2):
+    x={}
+    ids_tensor=q.get(block=True)
+    if batch_size>len(ids_tensor[list(ids_tensor)[0]]):
+        batch_size=len(ids_tensor[list(ids_tensor)[0]])
+    for key in ids_tensor.keys():
+        x[key]=ids_tensor[key][:batch_size]
+        ids_tensor[key]=ids_tensor[key][batch_size:]
+    q.put(ids_tensor, block=True)
+    return x
 
 def my_preprocess(self, **kwargs):
     preprocess_params, forward_params, postprocess_params = self._sanitize_parameters(**kwargs)
@@ -59,7 +92,7 @@ def my_preprocess(self, **kwargs):
 
     if "TOKENIZERS_PARALLELISM" not in os.environ:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    return forward_params
+    return forward_params,postprocess_params
 
 def my_sample(
         self,
@@ -243,12 +276,15 @@ def my__forward(self, model_inputs, **generate_kwargs):
     if input_ids.shape[1] == 0:
         input_ids = None
         attention_mask = None
-        in_b = 1
-    else:
-        in_b = input_ids.shape[0]
+    #     in_b = 1
+    # else:
+    #     in_b = input_ids.shape[0]
     prompt_text = model_inputs.pop("prompt_text")
 
+    postprocess_params=generate_kwargs.pop("postprocess_params")
     process_list=generate_kwargs.pop("process_list")
+    q=generate_kwargs.pop("q")
+
     # If there is a prefix, we may need to adjust the generation length. Do so without permanently modifying
     # generate_kwargs, as some of the parameterization may come from the initialization of the pipeline.
     generate_kwargs = copy.deepcopy(generate_kwargs)
@@ -272,17 +308,17 @@ def my__forward(self, model_inputs, **generate_kwargs):
     generated_sequence,attention_mask,unfinished_sequences = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
     for index,seq in enumerate(unfinished_sequences):
         if seq==1:
-            p0 = Process(target=unfinished_seq, args=(self, generated_sequence[index],attention_mask[index],))
+            p0 = Process(target=unfinished_seq, args=(q,generated_sequence[index],attention_mask[index],prompt_text[index],))
             p0.start()
             # p0.join()
             process_list.append(p0)
         else:
-            p0 = Process(target=finished_seq, args=(self,{"generated_sequence":[generated_sequence[index]],"input_ids": input_ids[index],"prompt_text":prompt_text[index]},))
+            p0 = Process(target=finished_seq, args=(self,{"generated_sequence":[generated_sequence[index]],"input_ids": input_ids[index],"prompt_text":prompt_text[index]},postprocess_params,))
             p0.start()
             # p0.join()
             process_list.append(p0)
-    return None
-def finished_seq(self,model_outputs):
+    return process_list
+def finished_seq(self,model_outputs,postprocess_params):
     with self.device_placement():
         if self.framework == "tf":
             pass
@@ -292,11 +328,15 @@ def finished_seq(self,model_outputs):
                 model_outputs = self._ensure_tensor_on_device(model_outputs, device=torch.device("cpu"))
         else:
             raise ValueError(f"Framework {self.framework} is not supported")
-    output = self.postprocess(model_outputs)
+    output = self.postprocess(model_outputs,**postprocess_params)
     print(output)
 
-def unfinished_seq(self,input_id,attention_mask):
-#     插入显存
+def unfinished_seq(q,input_ids,attention_mask,prompt_text):
+    ids_tensor=q.get(block=True)
+    ids_tensor["input_ids"]=torch.cat((ids_tensor["input_ids"],input_ids),dim=0)
+    ids_tensor["attention_mask"]=torch.cat((ids_tensor["attention_mask"], attention_mask), dim=0)
+    ids_tensor["prompt_text"] = torch.cat((ids_tensor["prompt_text"], prompt_text["prompt_text"]), dim=0)
+    q.put(ids_tensor, block=True)
 
 def my_forward(self, model_inputs, **forward_params):
     with self.device_placement():
