@@ -25,18 +25,20 @@ from multiprocessing import Process, Queue
 
 import torch
 
-def text2id(q,tokenizer,framework, batch_size=8, feature_extractor=None):
+def text2id(q,tokenizer,framework,collate_fn,text_size=8):
+    if text_size<=0:
+        raise ValueError("text_size<=0")
     seq_list = ["Hello, I'm a language model,", "Who is Jack?", "I want some rice,"]
     # while True:
     #     yield random.sample(seq_list, 1)[0]
-    prompt_texts = np.random.choice(seq_list, batch_size)
+    prompt_texts = np.random.choice(seq_list, text_size)
     items = []
     for prompt_text in prompt_texts:
         inputs = tokenizer(prompt_text, padding=False, add_special_tokens=False, return_tensors=framework)
         inputs["prompt_text"] = prompt_text
         items.append(inputs)
-    collate_fn = no_collate_fn if batch_size == 1 else pad_collate_fn(tokenizer, feature_extractor)
-    # {'attention_mask': tensor([[1, 1, 1, 1, 1, 0, 0, 0],
+    # items:[{'input_ids': tensor([[   40,   765,   617, 11464,    11]]), 'attention_mask': tensor([[1, 1, 1, 1, 1]]), 'prompt_text': 'I want some rice,'}, {'input_ids': tensor([[15496,    11,   314,  1101,   257,  3303,  2746,    11]]), 'attention_mask': tensor([[1, 1, 1, 1, 1, 1, 1, 1]]), 'prompt_text': "Hello, I'm a language model,"}, {'input_ids': tensor([[   40,   765,   617, 11464,    11]]), 'attention_mask': tensor([[1, 1, 1, 1, 1]]), 'prompt_text': 'I want some rice,'}, {'input_ids': tensor([[   40,   765,   617, 11464,    11]]), 'attention_mask': tensor([[1, 1, 1, 1, 1]]), 'prompt_text': 'I want some rice,'}, {'input_ids': tensor([[15496,    11,   314,  1101,   257,  3303,  2746,    11]]), 'attention_mask': tensor([[1, 1, 1, 1, 1, 1, 1, 1]]), 'prompt_text': "Hello, I'm a language model,"}, {'input_ids': tensor([[15496,    11,   314,  1101,   257,  3303,  2746,    11]]), 'attention_mask': tensor([[1, 1, 1, 1, 1, 1, 1, 1]]), 'prompt_text': "Hello, I'm a language model,"}, {'input_ids': tensor([[   40,   765,   617, 11464,    11]]), 'attention_mask': tensor([[1, 1, 1, 1, 1]]), 'prompt_text': 'I want some rice,'}, {'input_ids': tensor([[8241,  318, 3619,   30]]), 'attention_mask': tensor([[1, 1, 1, 1]]), 'prompt_text': 'Who is Jack?'}]
+    # ids_tensor:{'attention_mask': tensor([[1, 1, 1, 1, 1, 0, 0, 0],
     #                            [1, 1, 1, 1, 1, 1, 1, 1],
     #                            [1, 1, 1, 1, 1, 0, 0, 0],
     #                            [1, 1, 1, 1, 1, 0, 0, 0],
@@ -54,21 +56,37 @@ def text2id(q,tokenizer,framework, batch_size=8, feature_extractor=None):
     #                                                        [15496, 11, 314, 1101, 257, 3303, 2746, 11],
     #                                                        [40, 765, 617, 11464, 11, 50256, 50256, 50256],
     #                                                        [8241, 318, 3619, 30, 50256, 50256, 50256, 50256]])}
-    x = collate_fn(items)
     ids_tensor = q.get(block=True)
-    if ids_tensor==None:
-        q.put(x, block=True)
-    else:
-        ids_tensor["input_ids"] = torch.cat((ids_tensor["input_ids"],x["input_ids"]), dim=0)
-        ids_tensor["attention_mask"] = torch.cat((ids_tensor["attention_mask"],x["attention_mask"]), dim=0)
-        ids_tensor["prompt_text"] = torch.cat((ids_tensor["prompt_text"],x["prompt_text"]), dim=0)
-        q.put(ids_tensor, block=True)
+    if ids_tensor!=None:
+        items=dict_list2list_dict(ids_tensor,items)
+    x = collate_fn(items)
+    if len(x["input_ids"].shape) == 1:
+        x["input_ids"] = torch.unsqueeze(x["input_ids"], 0)
+        x["attention_mask"] = torch.unsqueeze(x["attention_mask"], 0)
+    if isinstance(x['prompt_text'], str):
+        x['prompt_text'] = [x['prompt_text']]
+    q.put(x, block=True)
+
+def dict_list2list_dict(ids_tensor,items):
+    # {'input_ids': tensor([[   40,   765,   617, 11464,    11]]), 'attention_mask': tensor([[1, 1, 1, 1, 1]]), 'prompt_text': 'I want some rice,'}
+    keys=ids_tensor.keys()
+    length=len(ids_tensor[list(ids_tensor)[0]])
+    for i in range(length):
+        new_item={}
+        for key in keys:
+            new_item[key]=ids_tensor[key][i]
+        items.append(new_item)
+    return items
 
 def data(q,batch_size=2):
-    x={}
-    ids_tensor=q.get(block=True)
-    if batch_size>len(ids_tensor[list(ids_tensor)[0]]):
-        batch_size=len(ids_tensor[list(ids_tensor)[0]])
+    if batch_size<=0:
+        raise ValueError("batch size<=0")
+    while True:
+        ids_tensor=q.get(block=True)
+        if len(ids_tensor[list(ids_tensor)[0]])>=batch_size:
+            break
+        q.put(ids_tensor,block=True)
+    x = {}
     for key in ids_tensor.keys():
         x[key]=ids_tensor[key][:batch_size]
         ids_tensor[key]=ids_tensor[key][batch_size:]
@@ -284,6 +302,7 @@ def my__forward(self, model_inputs, **generate_kwargs):
     postprocess_params=generate_kwargs.pop("postprocess_params")
     process_list=generate_kwargs.pop("process_list")
     q=generate_kwargs.pop("q")
+    collate_fn=generate_kwargs.pop("collate_fn")
 
     # If there is a prefix, we may need to adjust the generation length. Do so without permanently modifying
     # generate_kwargs, as some of the parameterization may come from the initialization of the pipeline.
@@ -308,7 +327,7 @@ def my__forward(self, model_inputs, **generate_kwargs):
     generated_sequence,attention_mask,unfinished_sequences = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
     for index,seq in enumerate(unfinished_sequences):
         if seq==1:
-            p0 = Process(target=unfinished_seq, args=(q,generated_sequence[index],attention_mask[index],prompt_text[index],))
+            p0 = Process(target=unfinished_seq, args=(q,generated_sequence[index],attention_mask[index],prompt_text[index],collate_fn,))
             p0.start()
             # p0.join()
             process_list.append(p0)
@@ -331,12 +350,26 @@ def finished_seq(self,model_outputs,postprocess_params):
     output = self.postprocess(model_outputs,**postprocess_params)
     print(output)
 
-def unfinished_seq(q,input_ids,attention_mask,prompt_text):
-    ids_tensor=q.get(block=True)
-    ids_tensor["input_ids"]=torch.cat((ids_tensor["input_ids"],input_ids),dim=0)
-    ids_tensor["attention_mask"]=torch.cat((ids_tensor["attention_mask"], attention_mask), dim=0)
-    ids_tensor["prompt_text"] = torch.cat((ids_tensor["prompt_text"], prompt_text["prompt_text"]), dim=0)
-    q.put(ids_tensor, block=True)
+def unfinished_seq(q,input_ids,attention_mask,prompt_text,collate_fn):
+    # 维度
+    if len(input_ids.shape)==1:
+        input_ids=torch.unsqueeze(input_ids,0)
+        attention_mask=torch.unsqueeze(attention_mask,0)
+    if isinstance(prompt_text,str):
+        prompt_text=[prompt_text]
+    new_ids_tensor = {}
+    new_ids_tensor["input_ids"] = input_ids
+    new_ids_tensor["attention_mask"] = attention_mask
+    new_ids_tensor["prompt_text"] = prompt_text
+
+    # padding and batch
+    items=[]
+    ids_tensor = q.get(block=True)
+    if ids_tensor != None:
+        items = dict_list2list_dict(ids_tensor, items)
+    items = dict_list2list_dict(new_ids_tensor, items)
+    x = collate_fn(items)
+    q.put(x, block=True)
 
 def my_forward(self, model_inputs, **forward_params):
     with self.device_placement():

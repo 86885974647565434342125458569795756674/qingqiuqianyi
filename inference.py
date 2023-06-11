@@ -2,10 +2,11 @@ from transformers import pipeline, set_seed
 import types
 from my_pipeline import data, my_preprocess, my_sample, my_forward, my__forward, text2id
 from multiprocessing import Process, Queue
+from transformers.pipelines.base import no_collate_fn, pad_collate_fn
 
 if __name__=='__main__':
     set_seed(42)
-    init_text_size = 8
+    text_size = 8
     max_length = 10
     batch_size = 2
     epoch=4
@@ -22,12 +23,16 @@ if __name__=='__main__':
 
     q=Queue()
     q.put(None, block=True)
-    text2id(q,generator.tokenizer,generator.framework,init_text_size)
+
+    feature_extractor = generator.feature_extractor if generator.feature_extractor is not None else generator.image_processor
+    collate_fn = no_collate_fn if batch_size == 1 else pad_collate_fn(generator.tokenizer, feature_extractor)
+    text2id(q,generator.tokenizer,generator.framework,collate_fn,text_size)
 
     forward_params,postprocess_params=generator.my_preprocess(max_length=max_length)
     forward_params["postprocess_params"]=postprocess_params
     forward_params["process_list"]=[]
     forward_params["q"]=q
+    forward_params["collate_fn"]=collate_fn
 
     for _ in range(epoch):
         x=data(q,batch_size)
@@ -36,3 +41,7 @@ if __name__=='__main__':
 
     for p0 in forward_params["process_list"]:
         p0.join()
+
+    ids_tensor = q.get(block=True)
+    for i in ids_tensor["prompt_text"]:
+        print(i)
