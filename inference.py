@@ -11,7 +11,7 @@ if __name__ == '__main__':
     text_size = batch_size * 4
     # epoch = text_size // batch_size
     epoch=1
-    generator = pipeline('text-generation', model='gpt2')
+    generator = pipeline('text-generation', model='gpt2', device=0)
     generator.tokenizer.pad_token_id = generator.model.config.eos_token_id
 
     # for out in generator(data(generator.tokenizer,generator.framework,batch_size), batch_size=batch_size,max_length=100):
