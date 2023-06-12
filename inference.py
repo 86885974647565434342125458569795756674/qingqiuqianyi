@@ -1,15 +1,16 @@
 from transformers import pipeline, set_seed
 import types
-from my_pipeline import data, my_preprocess, my_sample, my_forward, my__forward, text2id
-from multiprocessing import Process, Queue
-from transformers.pipelines.base import no_collate_fn, pad_collate_fn
+from my_pipeline import data, my_preprocess, my_sample, my_forward, my__forward, text2id, my_pad_collate_fn, my_inner, \
+    my_no_collate_fn
+from multiprocessing import Queue
 
-if __name__=='__main__':
+if __name__ == '__main__':
     set_seed(42)
-    text_size = 8
     max_length = 10
     batch_size = 2
-    epoch=4
+    text_size = batch_size * 4
+    # epoch = text_size // batch_size
+    epoch=1
     generator = pipeline('text-generation', model='gpt2')
     generator.tokenizer.pad_token_id = generator.model.config.eos_token_id
 
@@ -21,21 +22,26 @@ if __name__=='__main__':
     generator._forward = types.MethodType(my__forward, generator)
     generator.forward = types.MethodType(my_forward, generator)
 
-    q=Queue()
+    q = Queue()
     q.put(None, block=True)
 
     feature_extractor = generator.feature_extractor if generator.feature_extractor is not None else generator.image_processor
-    collate_fn = no_collate_fn if batch_size == 1 else pad_collate_fn(generator.tokenizer, feature_extractor)
-    text2id(q,generator.tokenizer,generator.framework,collate_fn,text_size)
+    f_padding_value, t_padding_value, padding_side = my_pad_collate_fn(generator.tokenizer, feature_extractor)
+    collate_fn_params = {"tokenizer": generator.tokenizer, "feature_extractor": feature_extractor,
+                         "f_padding_value": f_padding_value, "t_padding_value": t_padding_value,
+                         "padding_side": padding_side}
+    collate_fn = my_no_collate_fn if batch_size == 1 else my_inner
+    text2id(q, generator.tokenizer, generator.framework, collate_fn, collate_fn_params, text_size)
 
-    forward_params,postprocess_params=generator.my_preprocess(max_length=max_length)
-    forward_params["postprocess_params"]=postprocess_params
-    forward_params["process_list"]=[]
-    forward_params["q"]=q
-    forward_params["collate_fn"]=collate_fn
+    forward_params, postprocess_params = generator.my_preprocess(max_length=max_length)
+    forward_params["postprocess_params"] = postprocess_params
+    forward_params["process_list"] = []
+    forward_params["q"] = q
+    forward_params["collate_fn"] = collate_fn
+    forward_params["collate_fn_params"] = collate_fn_params
 
     for _ in range(epoch):
-        x=data(q,batch_size)
+        x = data(q, batch_size)
         process_list = generator.forward(x, **forward_params)
         forward_params["process_list"] = process_list
 

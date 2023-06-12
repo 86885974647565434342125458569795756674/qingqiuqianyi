@@ -6,10 +6,7 @@ import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
-import torch
 from torch import nn
-
-from transformers.pipelines.base import no_collate_fn, pad_collate_fn
 
 import os
 
@@ -25,8 +22,132 @@ from multiprocessing import Process, Queue
 
 import torch
 
-def text2id(q,tokenizer,framework,collate_fn,text_size=8):
-    if text_size<=0:
+
+def my_pad(items, key, padding_value, padding_side):
+    batch_size = len(items)
+    if isinstance(items[0][key], torch.Tensor):
+        # Others include `attention_mask` etc...
+        shape = items[0][key].shape
+        dim = len(shape)
+        if key in ["pixel_values", "image"]:
+            # This is probable image so padding shouldn't be necessary
+            # B, C, H, W
+            return torch.cat([item[key] for item in items], dim=0)
+        elif dim == 4 and key == "input_features":
+            # this is probably a mel spectrogram batched
+            return torch.cat([item[key] for item in items], dim=0)
+        max_length = max(item[key].shape[1] for item in items)
+        min_length = min(item[key].shape[1] for item in items)
+        dtype = items[0][key].dtype
+
+        if dim == 2:
+            if max_length == min_length:
+                # Bypass for `ImageGPT` which doesn't provide a padding value, yet
+                # we can consistently pad since the size should be matching
+                return torch.cat([item[key] for item in items], dim=0)
+            tensor = torch.zeros((batch_size, max_length), dtype=dtype) + padding_value
+        elif dim == 3:
+            tensor = torch.zeros((batch_size, max_length, shape[-1]), dtype=dtype) + padding_value
+        elif dim == 4:
+            tensor = torch.zeros((batch_size, max_length, shape[-2], shape[-1]), dtype=dtype) + padding_value
+
+        for i, item in enumerate(items):
+            if dim == 2:
+                if padding_side == "left":
+                    tensor[i, -len(item[key][0]):] = item[key][0].clone()
+                else:
+                    tensor[i, : len(item[key][0])] = item[key][0].clone()
+            elif dim == 3:
+                if padding_side == "left":
+                    tensor[i, -len(item[key][0]):, :] = item[key][0].clone()
+                else:
+                    tensor[i, : len(item[key][0]), :] = item[key][0].clone()
+            elif dim == 4:
+                if padding_side == "left":
+                    tensor[i, -len(item[key][0]):, :, :] = item[key][0].clone()
+                else:
+                    tensor[i, : len(item[key][0]), :, :] = item[key][0].clone()
+
+        return tensor
+    else:
+        return [item[key] for item in items]
+
+
+def my_no_collate_fn(items, tokenizer, feature_extractor, f_padding_value, t_padding_value, padding_side):
+    if len(items) != 1:
+        raise ValueError("This collate_fn is meant to be used with batch_size=1")
+    return items[0]
+
+
+def my_pad_collate_fn(tokenizer, feature_extractor):
+    f_padding_value = None
+    # Tokenizer
+    t_padding_side = None
+    # Feature extractor
+    f_padding_side = None
+    if tokenizer is None and feature_extractor is None:
+        raise ValueError("Pipeline without tokenizer or feature_extractor cannot do batching")
+    if tokenizer is not None:
+        if tokenizer.pad_token_id is None:
+            raise ValueError(
+                "Pipeline with tokenizer without pad_token cannot do batching. You can try to set it with "
+                "`pipe.tokenizer.pad_token_id = model.config.eos_token_id`."
+            )
+        else:
+            t_padding_value = tokenizer.pad_token_id
+            t_padding_side = tokenizer.padding_side
+    if feature_extractor is not None:
+        # Feature extractor can be images, where no padding is expected
+        f_padding_value = getattr(feature_extractor, "padding_value", None)
+        f_padding_side = getattr(feature_extractor, "padding_side", None)
+
+    if t_padding_side is not None and f_padding_side is not None and t_padding_side != f_padding_side:
+        raise ValueError(
+            f"The feature extractor, and tokenizer don't agree on padding side {t_padding_side} != {f_padding_side}"
+        )
+    padding_side = "right"
+    if t_padding_side is not None:
+        padding_side = t_padding_side
+    if f_padding_side is not None:
+        padding_side = f_padding_side
+    return f_padding_value, t_padding_value, padding_side
+
+
+def my_inner(items, tokenizer, feature_extractor, f_padding_value, t_padding_value, padding_side):
+    keys = set(items[0].keys())
+    for item in items:
+        if set(item.keys()) != keys:
+            raise ValueError(
+                f"The elements of the batch contain different keys. Cannot batch them ({set(item.keys())} !="
+                f" {keys})"
+            )
+    # input_values, input_pixels, input_ids, ...
+    padded = {}
+    no_padded = {}
+    for key in keys:
+        if key in {"input_ids"}:
+            # ImageGPT uses a feature extractor
+            if tokenizer is None and feature_extractor is not None:
+                _padding_value = f_padding_value
+            else:
+                _padding_value = t_padding_value
+        elif key in {"input_values", "pixel_values", "input_features"}:
+            _padding_value = f_padding_value
+        elif key in {"p_mask", "special_tokens_mask"}:
+            _padding_value = 1
+        elif key in {"attention_mask", "token_type_ids"}:
+            _padding_value = 0
+        else:
+            # This is likely another random key maybe even user provided
+            _padding_value = 0
+        padded[key] = my_pad(items, key, _padding_value, padding_side)
+        # no_padded[key]=_no_pad(items, key, _padding_value, padding_side)
+    return padded
+    # return no_padded
+
+
+def text2id(q, tokenizer, framework, collate_fn, collate_fn_params, text_size=8):
+    if text_size <= 0:
         raise ValueError("text_size<=0")
     seq_list = ["Hello, I'm a language model,", "Who is Jack?", "I want some rice,"]
     # while True:
@@ -57,9 +178,9 @@ def text2id(q,tokenizer,framework,collate_fn,text_size=8):
     #                                                        [40, 765, 617, 11464, 11, 50256, 50256, 50256],
     #                                                        [8241, 318, 3619, 30, 50256, 50256, 50256, 50256]])}
     ids_tensor = q.get(block=True)
-    if ids_tensor!=None:
-        items=dict_list2list_dict(ids_tensor,items)
-    x = collate_fn(items)
+    if ids_tensor is not None:
+        items = dict_list2list_dict(ids_tensor, items)
+    x = collate_fn(items, **collate_fn_params)
     if len(x["input_ids"].shape) == 1:
         x["input_ids"] = torch.unsqueeze(x["input_ids"], 0)
         x["attention_mask"] = torch.unsqueeze(x["attention_mask"], 0)
@@ -67,31 +188,37 @@ def text2id(q,tokenizer,framework,collate_fn,text_size=8):
         x['prompt_text'] = [x['prompt_text']]
     q.put(x, block=True)
 
-def dict_list2list_dict(ids_tensor,items):
+
+def dict_list2list_dict(ids_tensor, items):
     # {'input_ids': tensor([[   40,   765,   617, 11464,    11]]), 'attention_mask': tensor([[1, 1, 1, 1, 1]]), 'prompt_text': 'I want some rice,'}
-    keys=ids_tensor.keys()
-    length=len(ids_tensor[list(ids_tensor)[0]])
+    keys = ids_tensor.keys()
+    length = len(ids_tensor[list(ids_tensor)[0]])
     for i in range(length):
-        new_item={}
+        new_item = {}
         for key in keys:
-            new_item[key]=ids_tensor[key][i]
+            if isinstance(ids_tensor[key][i],torch.Tensor):
+                new_item[key] = torch.unsqueeze(ids_tensor[key][i], 0)
+            else:
+                new_item[key]=ids_tensor[key][i]
         items.append(new_item)
     return items
 
-def data(q,batch_size=2):
-    if batch_size<=0:
+
+def data(q, batch_size=2):
+    if batch_size <= 0:
         raise ValueError("batch size<=0")
     while True:
-        ids_tensor=q.get(block=True)
-        if len(ids_tensor[list(ids_tensor)[0]])>=batch_size:
+        ids_tensor = q.get(block=True)
+        if len(ids_tensor[list(ids_tensor)[0]]) >= batch_size:
             break
-        q.put(ids_tensor,block=True)
+        q.put(ids_tensor, block=True)
     x = {}
     for key in ids_tensor.keys():
-        x[key]=ids_tensor[key][:batch_size]
-        ids_tensor[key]=ids_tensor[key][batch_size:]
+        x[key] = ids_tensor[key][:batch_size]
+        ids_tensor[key] = ids_tensor[key][batch_size:]
     q.put(ids_tensor, block=True)
     return x
+
 
 def my_preprocess(self, **kwargs):
     preprocess_params, forward_params, postprocess_params = self._sanitize_parameters(**kwargs)
@@ -110,14 +237,15 @@ def my_preprocess(self, **kwargs):
 
     if "TOKENIZERS_PARALLELISM" not in os.environ:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    return forward_params,postprocess_params
+    return forward_params, postprocess_params
+
 
 def my_sample(
         self,
         input_ids: torch.LongTensor,
-        logits_processor = None,
-        stopping_criteria = None,
-        logits_warper = None,
+        logits_processor=None,
+        stopping_criteria=None,
+        logits_warper=None,
         max_length: Optional[int] = None,
         pad_token_id: Optional[int] = None,
         eos_token_id: Optional[Union[int, List[int]]] = None,
@@ -126,9 +254,9 @@ def my_sample(
         output_scores: Optional[bool] = None,
         return_dict_in_generate: Optional[bool] = None,
         synced_gpus: bool = False,
-        streamer = None,
+        streamer=None,
         **model_kwargs,
-    ):
+):
     # logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
     # stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
     if max_length is not None:
@@ -200,7 +328,6 @@ def my_sample(
         output_attentions=output_attentions,
         output_hidden_states=output_hidden_states,
     )
-
 
     next_token_logits = outputs.logits[:, -1, :]
 
@@ -285,7 +412,8 @@ def my_sample(
     #         )
     # else:
     #     return input_ids
-    return input_ids,model_kwargs['attention_mask'],unfinished_sequences
+    return input_ids, model_kwargs['attention_mask'], unfinished_sequences
+
 
 def my__forward(self, model_inputs, **generate_kwargs):
     input_ids = model_inputs["input_ids"]
@@ -299,10 +427,11 @@ def my__forward(self, model_inputs, **generate_kwargs):
     #     in_b = input_ids.shape[0]
     prompt_text = model_inputs.pop("prompt_text")
 
-    postprocess_params=generate_kwargs.pop("postprocess_params")
-    process_list=generate_kwargs.pop("process_list")
-    q=generate_kwargs.pop("q")
-    collate_fn=generate_kwargs.pop("collate_fn")
+    postprocess_params = generate_kwargs.pop("postprocess_params")
+    process_list = generate_kwargs.pop("process_list")
+    q = generate_kwargs.pop("q")
+    collate_fn = generate_kwargs.pop("collate_fn")
+    collate_fn_params = generate_kwargs.pop("collate_fn_params")
 
     # If there is a prefix, we may need to adjust the generation length. Do so without permanently modifying
     # generate_kwargs, as some of the parameterization may come from the initialization of the pipeline.
@@ -310,34 +439,42 @@ def my__forward(self, model_inputs, **generate_kwargs):
     prefix_length = generate_kwargs.pop("prefix_length", 0)
     if prefix_length > 0:
         has_max_new_tokens = "max_new_tokens" in generate_kwargs or (
-            "generation_config" in generate_kwargs
-            and generate_kwargs["generation_config"].max_new_tokens is not None
+                "generation_config" in generate_kwargs
+                and generate_kwargs["generation_config"].max_new_tokens is not None
         )
         if not has_max_new_tokens:
             generate_kwargs["max_length"] = generate_kwargs.get("max_length") or self.model.config.max_length
             generate_kwargs["max_length"] += prefix_length
         has_min_new_tokens = "min_new_tokens" in generate_kwargs or (
-            "generation_config" in generate_kwargs
-            and generate_kwargs["generation_config"].min_new_tokens is not None
+                "generation_config" in generate_kwargs
+                and generate_kwargs["generation_config"].min_new_tokens is not None
         )
         if not has_min_new_tokens and "min_length" in generate_kwargs:
             generate_kwargs["min_length"] += prefix_length
 
     # BS x SL
-    generated_sequence,attention_mask,unfinished_sequences = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
-    for index,seq in enumerate(unfinished_sequences):
-        if seq==1:
-            p0 = Process(target=unfinished_seq, args=(q,generated_sequence[index],attention_mask[index],prompt_text[index],collate_fn,))
+    generated_sequence, attention_mask, unfinished_sequences = self.model.generate(input_ids=input_ids,
+                                                                                   attention_mask=attention_mask,
+                                                                                   **generate_kwargs)
+    for index, seq in enumerate(unfinished_sequences):
+        if seq == 1:
+            p0 = Process(target=unfinished_seq,
+                         args=(q, generated_sequence[index], attention_mask[index], prompt_text[index], collate_fn,
+                               collate_fn_params,))
             p0.start()
             # p0.join()
             process_list.append(p0)
         else:
-            p0 = Process(target=finished_seq, args=(self,{"generated_sequence":[generated_sequence[index]],"input_ids": input_ids[index],"prompt_text":prompt_text[index]},postprocess_params,))
+            p0 = Process(target=finished_seq, args=(self, {"generated_sequence": [generated_sequence[index]],
+                                                           "input_ids": input_ids[index],
+                                                           "prompt_text": prompt_text[index]}, postprocess_params,))
             p0.start()
             # p0.join()
             process_list.append(p0)
     return process_list
-def finished_seq(self,model_outputs,postprocess_params):
+
+
+def finished_seq(self, model_outputs, postprocess_params):
     with self.device_placement():
         if self.framework == "tf":
             pass
@@ -347,29 +484,28 @@ def finished_seq(self,model_outputs,postprocess_params):
                 model_outputs = self._ensure_tensor_on_device(model_outputs, device=torch.device("cpu"))
         else:
             raise ValueError(f"Framework {self.framework} is not supported")
-    output = self.postprocess(model_outputs,**postprocess_params)
+    output = self.postprocess(model_outputs, **postprocess_params)
     print(output)
 
-def unfinished_seq(q,input_ids,attention_mask,prompt_text,collate_fn):
+
+def unfinished_seq(q, input_ids, attention_mask, prompt_text, collate_fn, collate_fn_params):
     # 维度
-    if len(input_ids.shape)==1:
-        input_ids=torch.unsqueeze(input_ids,0)
-        attention_mask=torch.unsqueeze(attention_mask,0)
-    if isinstance(prompt_text,str):
-        prompt_text=[prompt_text]
-    new_ids_tensor = {}
-    new_ids_tensor["input_ids"] = input_ids
-    new_ids_tensor["attention_mask"] = attention_mask
-    new_ids_tensor["prompt_text"] = prompt_text
+    if len(input_ids.shape) == 1:
+        input_ids = torch.unsqueeze(input_ids, 0)
+        attention_mask = torch.unsqueeze(attention_mask, 0)
+    if isinstance(prompt_text, str):
+        prompt_text = [prompt_text]
+    new_ids_tensor = {"input_ids": input_ids, "attention_mask": attention_mask, "prompt_text": prompt_text}
 
     # padding and batch
-    items=[]
+    items = []
     ids_tensor = q.get(block=True)
-    if ids_tensor != None:
+    if ids_tensor is not None:
         items = dict_list2list_dict(ids_tensor, items)
     items = dict_list2list_dict(new_ids_tensor, items)
-    x = collate_fn(items)
+    x = collate_fn(items, **collate_fn_params)
     q.put(x, block=True)
+
 
 def my_forward(self, model_inputs, **forward_params):
     with self.device_placement():
