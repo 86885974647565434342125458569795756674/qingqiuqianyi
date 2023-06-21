@@ -8,6 +8,7 @@ if __name__ == '__main__':
 
     epoch = 2
     q = Queue()
+    q.cancel_join_thread()
     text2id(q)
     forward_params = {"q": q, "process_list": []}
     for _ in range(epoch):
