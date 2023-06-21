@@ -151,4 +151,5 @@ if __name__ == "__main__":
     done_event.set()
     time.sleep(MP_STATUS_CHECK_INTERVAL * 2)
     for p in process_list:
-        p.terminate()
+        if p.is_alive():
+            p.terminate()
