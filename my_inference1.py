@@ -5,7 +5,7 @@ import time
 
 MP_STATUS_CHECK_INTERVAL = 2.0
 RUN_TIME = 4.0
-GPU_NUM = 4
+GPU_NUM = 2
 
 
 def prompt_to_id(done_event, Qid_to_1):
@@ -16,58 +16,59 @@ def prompt_to_id(done_event, Qid_to_1):
         Qid_to_1.put(xid)
         del xid
         time.sleep(1)
-    Qid_to_1.close()
 
 
 def id_queue(done_event, q, Qid_to_1):
     while True:
         try:
-            xid = Qid_to_1.get(timeout=MP_STATUS_CHECK_INTERVAL)
-        except queue.Empty:
-            continue
+            xid = Qid_to_1.get()
+        except Exception:
+            assert done_event.is_set()
+            break
         if xid is None:
             assert done_event.is_set()
             break
         q.put(xid)
         del xid
-    q.close()
 
 
 def send_id_from_id_queue(done_event, q, Qid_req, id_to_gpu_list):
     while True:
         try:
-            req_id = Qid_req.get(timeout=MP_STATUS_CHECK_INTERVAL)
-        except queue.Empty:
-            continue
+            req_id = Qid_req.get()
+        except Exception:
+            assert done_event.is_set()
+            break
         if req_id is None:
             assert done_event.is_set()
             break
-        xid = q.get()
+        try:
+            xid = q.get()
+        except Exception:
+            assert done_event.is_set()
+            break
+        if xid is None:
+            assert done_event.is_set()
+            break
         id_to_gpu_list[req_id].put(xid)
-        print(req_id)
         del req_id
         del xid
-    for id_to_gpu in id_to_gpu_list:
-        id_to_gpu.close()
+
 
 
 def one_iter(done_event, mid, forward, Qid_req, Qid_to_2, Q2_0_to_1, Q2_0_to_2):
     while True:
         Qid_req.put(mid)
-        while True:
-            try:
-                xid = Qid_to_2.get(timeout=MP_STATUS_CHECK_INTERVAL)
-            except queue.Empty:
-                continue
-            if xid is None:
-                assert done_event.is_set()
-                Qid_req.close()
-                Q2_0_to_1.close()
-                Q2_0_to_2.close()
-                return
+        try:
+            xid = Qid_to_2.get()
+        except Exception:
+            assert done_event.is_set()
+            break
+        if xid is None:
+            assert done_event.is_set()
             break
         xid = forward(xid)
-        if False:
+        if True:
             Q2_0_to_1.put(xid)
         else:
             Q2_0_to_2.put(xid)
@@ -77,29 +78,28 @@ def one_iter(done_event, mid, forward, Qid_req, Qid_to_2, Q2_0_to_1, Q2_0_to_2):
 def finished_seq(done_event, Q2_0_to_1):
     while True:
         try:
-            xid = Q2_0_to_1.get(timeout=MP_STATUS_CHECK_INTERVAL)
-        except queue.Empty:
-            continue
+            xid = Q2_0_to_1.get()
+        except Exception:
+            assert done_event.is_set()
+            break
         if xid is None:
             assert done_event.is_set()
             break
-        print(xid)
         del xid
 
 
 def unfinished_seq(done_event, Qid_to_1, Q2_0_to_2):
     while True:
         try:
-            xid = Q2_0_to_2.get(timeout=MP_STATUS_CHECK_INTERVAL)
-        except queue.Empty:
-            continue
+            xid = Q2_0_to_2.get()
+        except Exception:
+            assert done_event.is_set()
+            break
         if xid is None:
             assert done_event.is_set()
             break
         Qid_to_1.put(xid)
-        # print(xid)
         del xid
-    Qid_to_1.close()
 
 
 def forward(x):
@@ -156,18 +156,14 @@ if __name__ == "__main__":
     p1_1 = Process(target=send_id_from_id_queue, args=(done_event, q, Qid_req, id_to_gpu_list))
     process_list.append(p1_1)
 
+    # 执行
     for p in process_list:
         p.start()
     time.sleep(RUN_TIME)
 
+    # 结束
     done_event.set()
-
     for q in q_list:
         q.put(None)
-
     for p in process_list:
-        p.join(MP_STATUS_CHECK_INTERVAL)
-
-    for p in process_list:
-        if p.is_alive():
-            p.terminate()
+        p.join()
