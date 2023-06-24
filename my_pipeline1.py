@@ -58,7 +58,7 @@ def my__forward(self, model_inputs, **generate_kwargs):
     generated_sequence, attention_mask, unfinished_sequences = self.model.generate(input_ids=input_ids,
                                                                                    attention_mask=attention_mask,
                                                                                    **generate_kwargs)
-    return  generated_sequence, attention_mask, unfinished_sequences, prompt_text, input_ids, self
+    return generated_sequence, attention_mask, unfinished_sequences, prompt_text, input_ids
 
 def my_preprocess(self, **kwargs):
     preprocess_params, forward_params, postprocess_params = self._sanitize_parameters(**kwargs)
