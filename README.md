@@ -100,9 +100,191 @@ while True:
 
 return input_ids
 
-
-
 # 1
+
+```text
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+from torchvision import datasets
+from torchvision.transforms import ToTensor
+
+# Download test data from open datasets.
+test_data = datasets.FashionMNIST(
+    root="data",
+    train=False,
+    download=True,
+    transform=ToTensor(),
+)
+
+batch_size = 64
+
+# Create data loaders.
+test_dataloader = DataLoader(test_data, batch_size=batch_size num_workers=4)
+
+iterator = iter(test_dataloader)
+X, y = next(iterator)
+print(f"Shape of X [N, C, H, W]: {X.shape}")
+print(f"Shape of y: {y.shape} {y.dtype}")
+```
+
+DataLoader.\_\_init__:
+
+sampler = SequentialSampler(dataset)
+
+batch_sampler = BatchSampler(sampler, batch_size, drop_last)
+
+DataLoader.\_\_iter__:
+
+return self._get_iterator()
+
+DataLoader._get_iterator:
+
+return _MultiProcessingDataLoaderIter(self)
+
+DataLoader._index_sampler:
+
+return self.batch_sampler
+
+_MultiProcessingDataLoaderIter.\_\_init__:
+
+self._dataset = loader.dataset
+
+self.\_index_sampler = loader._index_sampler
+
+self.\_sampler_iter = iter(self._index_sampler)
+
+multiprocessing_context = multiprocessing
+
+self._worker_result_queue = multiprocessing_context.Queue()
+
+self._workers_done_event = multiprocessing_context.Event()
+
+self.\_index_queues = []
+
+self._workers = []
+
+index_queue = multiprocessing_context.Queue()
+
+index_queue.cancel_join_thread()
+
+target=\_utils.worker._worker_loop
+
+w.daemon = True
+
+w.start()
+
+self.\_data_queue = self._worker_result_queue
+
+self._reset(loader, first_iter=True)
+
+\_MultiProcessingDataLoaderIter._reset:
+
+self.\_sampler_iter = iter(self._index_sampler)
+
+for _ in range(self.\_prefetch_factor * self.\_num_workers):
+    self._try_put_index()
+
+\_BaseDataLoaderIter._next_index:
+
+return next(self._sampler_iter)
+
+\_MultiProcessingDataLoaderIter._try_put_index:
+
+index = self._next_index()
+
+self.\_index_queues[worker_queue_idx].put((self._send_idx, index))
+
+\_BaseDataLoaderIter.\__next__:
+
+data = self._next_data()
+
+return data
+
+_MultiProcessingDataLoaderIter.\_next_data:
+
+if not self.\_persistent_workers:
+                    self._shutdown_workers()
+                raise StopIteration
+
+idx, data = self._get_data()
+
+return self._process_data(data)
+
+\_MultiProcessingDataLoaderIter._get_data:
+
+while True:
+
+​    success, data = self._try_get_data()
+
+​    if success:
+
+​        return data
+
+_MultiProcessingDataLoaderIter.\_try_get_data:
+
+data = self._data_queue.get(timeout=timeout)
+return (True, data)
+
+\_MultiProcessingDataLoaderIter._process_data:
+
+self._try_put_index()
+
+return data
+
+utils.data.\_utils.worker._worker_loop:
+
+while watchdog.is_alive():
+
+​	r = index_queue.get(timeout=MP_STATUS_CHECK_INTERVAL)
+
+​	elif r is None:
+​                	assert done_event.is_set() or iteration_end
+​               	 break
+
+​	data = fetcher.fetch(index)
+
+​	data_queue.put((idx, data))
+
+​	del data, idx, index, r
+
+if done_event.is_set():
+    data_queue.cancel_join_thread()
+    data_queue.close()
+
+\_MultiProcessingDataLoaderIter._shutdown_workers:
+
+self._workers_done_event.set()
+
+for worker_id in range(len(self._workers)):
+
+​	self.\_mark_worker_as_unavailable(worker_id, shutdown=True)
+
+for w in self._workers:
+
+​    w.join(timeout=\_utils.MP_STATUS_CHECK_INTERVAL)
+
+for q in self._index_queues:
+
+​    q.cancel_join_thread()
+
+​    q.close()
+
+for w in self._workers:
+
+​	if w.is_alive():
+
+​        w.terminate()
+
+\_MultiProcessingDataLoaderIter.\_mark_worker_as_unavailable:
+
+q = self._index_queues[worker_id]
+
+q.put(None)
+
+self._workers_status[worker_id] = False
+
+# 2
 
 preprocess:text-id,mask(tokenizer)
 
@@ -126,7 +308,7 @@ my__forward:前向，分别处理完成和未完成seq
 
 my_sample:一次迭代
 
-# 2
+# 3
 
 只考虑内存
 
@@ -162,12 +344,8 @@ my_sample:一次迭代
 
 进程2：通过Qid_to_1发送id
 
-# 3
+# 4
 
 哪些放到显存上，怎么放到显存上，缺少全局kv_cache管理器
 
 监控显存大小：一个新进程轮询显存大小
-
-
-
-目前先看看pytorch源码，再看下一步做什么
