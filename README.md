@@ -20,6 +20,20 @@ scp D:/qingqiuqianyi/qingqiuqianyi/debug.py cyy@172.18.217.119:/data/cyy
 
 # 0
 
+```text
+from transformers import pipeline
+def data():
+	seq_list = ["Hello, I'm a language model,", "Who is Jack?", "I want some rice,"]
+    while True:
+		yield random.sample(seq_list, 1)[0]
+
+generator = pipeline('text-generation', model='gpt2')
+generator.tokenizer.pad_token_id = generator.model.config.eos_token_id
+    
+for out in generator(data(), batch_size=batch_size, max_length=100):
+    print(out)
+```
+
 pipelines.\__init__.py.pipeline:
 
 pipeline_class = targeted_task["impl"]
