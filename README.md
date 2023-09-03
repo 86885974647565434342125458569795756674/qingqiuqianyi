@@ -16,7 +16,7 @@ git config --global http.proxy http://172.18.216.:7890
 scp D:/qingqiuqianyi/qingqiuqianyi/debug.py cyy@172.18.217.119:/data/cyy
 ```
 
-你们直接从2开始看，对应的代码在src，在qingqiuqianyi目录下有相同文件，在qingqiuqianyi目录可以运行my_inference1.py
+直接从2开始看，对应的代码在src，在qingqiuqianyi目录下有相同文件，在qingqiuqianyi目录可以运行my_inference1.py
 
 # 0
 
